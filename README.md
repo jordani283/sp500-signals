@@ -53,3 +53,36 @@ Each run appends one row per ranked signal to `backtest_results.csv`
 sample size, theoretical and realistic EV per trade, estimated slippage and —
 for the regime-split signals — bull/bear win rates. Rerunning on different
 dates builds a historical log automatically.
+
+## Live signal monitoring (Supabase)
+
+`signal_monitor.py` (run each evening after the US close) and `trade_update.py`
+persist to a Supabase Postgres database instead of CSV files.
+
+Setup:
+
+1. Create a `.env` file in the project root with your project credentials:
+
+```
+SUPABASE_URL=https://<project-ref>.supabase.co
+SUPABASE_KEY=<anon-or-service-key>
+```
+
+`.env` is gitignored and must never be committed.
+
+2. Install dependencies: `.venv/bin/pip install -r requirements.txt`
+
+3. Create the database tables. Run `python setup_supabase.py`. With the anon
+   key, Postgres DDL cannot be executed through the API, so the script prints
+   the exact SQL to paste once into the Supabase dashboard SQL Editor
+   (Dashboard → SQL Editor → New query). It creates two tables:
+   - `signal_log` — one row per monitor run (full run history)
+   - `trade_log` — one PENDING row per fired signal, updated to CLOSED on exit
+
+Usage:
+
+- `python signal_monitor.py` — every run inserts a `signal_log` row; a fired
+  signal additionally inserts a PENDING `trade_log` row. Console output is
+  unchanged from the CSV version aside from the Supabase confirmation lines.
+- `python trade_update.py` — lists PENDING trades, records your entry/exit
+  prices, marks the trade CLOSED, and prints a running P&L vs the backtested EV.

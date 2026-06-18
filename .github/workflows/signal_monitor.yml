@@ -1,0 +1,34 @@
+name: S&P 500 Signal Monitor
+
+on:
+  schedule:
+    # 21:30 UTC, Mon-Fri. 30 mins after the US market close: 9:30pm BST in
+    # summer, 8:30pm GMT in winter (UTC stays fixed; UK local time shifts).
+    - cron: "30 21 * * 1-5"
+  workflow_dispatch: {}
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+
+jobs:
+  run-signal-monitor:
+    name: run-signal-monitor
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run signal monitor
+        run: python signal_monitor.py

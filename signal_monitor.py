@@ -4,29 +4,31 @@ S&P 500 Signal Monitor
 Run this each evening AFTER the US market close. It downloads recent ^GSPC data,
 checks for two live trading signals (H3: 20-day closing low, H1: 5+ consecutive
 red days), reports the current regime, and prints an exact action plan for
-tomorrow. When a signal fires it appends a PENDING row to trade_log.csv.
+tomorrow. Every run writes a row to the Supabase `signal_log` table, and when a
+signal fires it also inserts a PENDING row into the Supabase `trade_log` table.
 
-Fully self-contained — does NOT import backtest.py. Uses yfinance, pandas, numpy.
+Does NOT import backtest.py for its indicator logic. Uses yfinance, pandas,
+numpy, and the Supabase client (credentials loaded from .env).
 
 NOTE: the position-sizing figures are illustrative only and are NOT financial
 advice. The EV / win-rate / average-move numbers are the backtested results
 from backtest.py (2010-present, realistic open-entry where applicable).
 """
 
-import os
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from dotenv import load_dotenv
+
+# Load .env locally; no-op if the file is absent (e.g. in GitHub Actions, where
+# SUPABASE_URL / SUPABASE_KEY are injected from repository secrets instead).
+load_dotenv()
+
+from supabase_client import get_client
 
 TICKER = "^GSPC"
-TRADE_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_log.csv")
-
-TRADE_LOG_COLUMNS = [
-    "signal_date", "signal_type", "regime", "entry_date", "exit_date",
-    "entry_price", "exit_price", "actual_return", "status",
-]
 
 # Backtested stats (from backtest.py, 2010-present). Win rate & EV are the
 # realistic open-entry figures; avg win/loss are the per-trade averages.
@@ -97,18 +99,47 @@ def add_business_days(d, n: int):
 
 
 # ---------------------------------------------------------------------------
-# Trade log
+# Supabase persistence
 # ---------------------------------------------------------------------------
 
-def log_trade(signal_date, signal_type, regime, entry_date, exit_date) -> None:
-    row = {
-        "signal_date": signal_date, "signal_type": signal_type, "regime": regime,
-        "entry_date": entry_date, "exit_date": exit_date,
-        "entry_price": "", "exit_price": "", "actual_return": "", "status": "PENDING",
-    }
-    out = pd.DataFrame([row], columns=TRADE_LOG_COLUMNS)
-    needs_header = not os.path.exists(TRADE_LOG) or os.path.getsize(TRADE_LOG) == 0
-    out.to_csv(TRADE_LOG, mode="a", header=needs_header, index=False)
+def _iso(d) -> str | None:
+    """Serialise a date/None to an ISO string for Supabase (date columns)."""
+    return None if d is None else str(d)
+
+
+def log_signal_run(client, run_date, signal_date, signal_type, regime, spx_close,
+                   change_pct, ma_200, triggered, entry_date, exit_date) -> None:
+    """Insert one row into signal_log for every monitor run (full history)."""
+    stats = SIGNAL_STATS.get(signal_type)
+    client.table("signal_log").insert({
+        "run_date": _iso(run_date),
+        "signal_date": _iso(signal_date),
+        "signal_type": signal_type,
+        "regime": regime,
+        "spx_close": round(float(spx_close), 2),
+        "change_pct": round(float(change_pct), 4),
+        "ma_200": round(float(ma_200), 2),
+        "triggered": bool(triggered),
+        "entry_date": _iso(entry_date),
+        "exit_date": _iso(exit_date),
+        "realistic_ev_pct": stats["ev_realistic"] if stats else None,
+        "win_rate_pct": stats["win_realistic"] if stats else None,
+    }).execute()
+
+
+def log_trade(client, signal_date, signal_type, regime, entry_date, exit_date) -> None:
+    """Insert a PENDING trade row into trade_log when a signal fires."""
+    client.table("trade_log").insert({
+        "signal_date": _iso(signal_date),
+        "signal_type": signal_type,
+        "regime": regime,
+        "entry_date": _iso(entry_date),
+        "exit_date": _iso(exit_date),
+        "entry_price": None,
+        "exit_price": None,
+        "actual_return_pct": None,
+        "status": "PENDING",
+    }).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +272,8 @@ def main():
     exit_5d = add_business_days(entry_date, 4)          # close of 5th trading day
     exit_1d = entry_date                               # tomorrow's close
 
-    if not h3_fired and not h1_fired:
+    triggered = h3_fired or h1_fired
+    if not triggered:
         print("\nNO SIGNALS TODAY")
         print("================")
         print("Nothing to trade tomorrow.")
@@ -253,26 +285,39 @@ def main():
         else:
             day_word = "day" if more == 1 else "days"
             print(f"  H1 (5-day) triggers if {more} more consecutive red {day_word}")
-        return
-
-    # One or more signals fired. Combination takes priority.
-    if h3_fired and h1_fired:
-        signal_key = "H11"
-        print("\nNote: BOTH H3 and H1 fired today — this is an H11 COMBINATION signal "
-              "(historically the strongest of the three).")
-        exit_date = exit_5d
-    elif h3_fired:
-        signal_key = "H3"
-        exit_date = exit_5d
+        signal_key = "NONE"
+        log_entry_date = None
+        log_exit_date = None
     else:
-        signal_key = "H1"
-        exit_date = exit_1d
+        # One or more signals fired. Combination takes priority.
+        if h3_fired and h1_fired:
+            signal_key = "H11"
+            print("\nNote: BOTH H3 and H1 fired today — this is an H11 COMBINATION signal "
+                  "(historically the strongest of the three).")
+            exit_date = exit_5d
+        elif h3_fired:
+            signal_key = "H3"
+            exit_date = exit_5d
+        else:
+            signal_key = "H1"
+            exit_date = exit_1d
 
-    print_action_block(signal_key, today, regime, today_close, avg_gap_pct,
-                       entry_date, exit_date)
+        print_action_block(signal_key, today, regime, today_close, avg_gap_pct,
+                           entry_date, exit_date)
+        log_entry_date = entry_date
+        log_exit_date = exit_date
 
-    log_trade(today, signal_key, regime, entry_date, exit_date)
-    print("\nTrade logged to trade_log.csv — fill in entry_price tomorrow at open")
+    # ---- Persist to Supabase ------------------------------------------------
+    try:
+        client = get_client()
+        log_signal_run(client, today, today, signal_key, regime, today_close,
+                       change_today, sma200, triggered, log_entry_date, log_exit_date)
+        print("\nResults written to Supabase signal_log")
+        if triggered:
+            log_trade(client, today, signal_key, regime, log_entry_date, log_exit_date)
+            print("Trade logged to Supabase trade_log — fill in entry_price tomorrow at open")
+    except Exception as exc:
+        print(f"\nWARNING: could not write to Supabase — {str(exc)[:200]}")
 
 
 if __name__ == "__main__":

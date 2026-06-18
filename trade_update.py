@@ -1,24 +1,18 @@
 """
 Trade Updater
 =============
-Run this AFTER you close a trade that signal_monitor.py logged. It shows your
-PENDING trades, lets you enter the actual entry/exit prices, marks the trade
-CLOSED, and prints a running P&L summary compared with the backtested EV.
+Run this AFTER you close a trade that signal_monitor.py logged. It reads PENDING
+trades from the Supabase `trade_log` table, lets you enter the actual
+entry/exit prices, marks the trade CLOSED, and prints a running P&L summary
+compared with the backtested EV.
 
-Uses pandas / numpy only.
+Uses the Supabase client (credentials from .env), pandas and numpy.
 """
-
-import os
 
 import numpy as np
 import pandas as pd
 
-TRADE_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_log.csv")
-
-TRADE_LOG_COLUMNS = [
-    "signal_date", "signal_type", "regime", "entry_date", "exit_date",
-    "entry_price", "exit_price", "actual_return", "status",
-]
+from supabase_client import get_client
 
 # Backtested realistic EV per signal type (from backtest.py) for comparison.
 BACKTESTED_EV = {"H3": 0.6933, "H1": 0.4084, "H11": 0.6817}
@@ -41,15 +35,22 @@ def prompt_float(prompt: str):
         return val
 
 
-def print_pnl_summary(df: pd.DataFrame):
-    closed = df[df["status"] == "CLOSED"].copy()
+def print_pnl_summary(client):
+    """Pull all CLOSED trades from Supabase and print the running P&L."""
     print("\nRUNNING P&L SUMMARY")
     print("===================")
+    try:
+        resp = client.table("trade_log").select("*").eq("status", "CLOSED").execute()
+    except Exception as exc:
+        print(f"Could not read closed trades from Supabase — {str(exc)[:200]}")
+        return
+
+    closed = pd.DataFrame(resp.data)
     if closed.empty:
         print("No closed trades yet.")
         return
 
-    returns = pd.to_numeric(closed["actual_return"], errors="coerce").dropna()
+    returns = pd.to_numeric(closed["actual_return_pct"], errors="coerce").dropna()
     total = len(returns)
     wins = int((returns > 0).sum())
     win_rate = 100.0 * wins / total if total else 0.0
@@ -74,21 +75,28 @@ def print_pnl_summary(df: pd.DataFrame):
 
 
 def main():
-    if not os.path.exists(TRADE_LOG) or os.path.getsize(TRADE_LOG) == 0:
-        print(f"No trade log found at {TRADE_LOG}. Run signal_monitor.py first.")
+    try:
+        client = get_client()
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
         return
 
-    df = pd.read_csv(TRADE_LOG, dtype=str).reindex(columns=TRADE_LOG_COLUMNS)
-    pending = df[df["status"] == "PENDING"]
+    try:
+        resp = client.table("trade_log").select("*").eq("status", "PENDING") \
+            .order("signal_date").execute()
+    except Exception as exc:
+        print(f"ERROR: could not read PENDING trades from Supabase — {str(exc)[:200]}")
+        return
 
-    if pending.empty:
+    pending = resp.data
+    if not pending:
         print("No PENDING trades to update.")
-        print_pnl_summary(df)
+        print_pnl_summary(client)
         return
 
     print("PENDING TRADES")
     print("==============")
-    for pos, (idx, row) in enumerate(pending.iterrows(), 1):
+    for pos, row in enumerate(pending, 1):
         print(f"  [{pos}] {row['signal_date']}  {row['signal_type']:<4}  "
               f"entry {row['entry_date']} -> exit {row['exit_date']}  ({row['regime']})")
 
@@ -101,11 +109,10 @@ def main():
     except ValueError:
         print("Invalid selection — no changes made.")
         return
-    pending_idx = pending.index.tolist()
-    if not (1 <= sel <= len(pending_idx)):
+    if not (1 <= sel <= len(pending)):
         print("Selection out of range — no changes made.")
         return
-    target = pending_idx[sel - 1]
+    target = pending[sel - 1]
 
     entry_price = prompt_float("Enter entry_price (fill at open): ")
     if entry_price is None:
@@ -117,16 +124,21 @@ def main():
         return
 
     actual_return = (exit_price - entry_price) / entry_price * 100.0
-    df.loc[target, "entry_price"] = f"{entry_price:.2f}"
-    df.loc[target, "exit_price"] = f"{exit_price:.2f}"
-    df.loc[target, "actual_return"] = f"{actual_return:.4f}"
-    df.loc[target, "status"] = "CLOSED"
+    try:
+        client.table("trade_log").update({
+            "entry_price": round(entry_price, 2),
+            "exit_price": round(exit_price, 2),
+            "actual_return_pct": round(actual_return, 4),
+            "status": "CLOSED",
+        }).eq("id", target["id"]).execute()
+    except Exception as exc:
+        print(f"ERROR: could not update trade in Supabase — {str(exc)[:200]}")
+        return
 
-    df.to_csv(TRADE_LOG, index=False)
-    print(f"\nTrade closed: {df.loc[target, 'signal_type']} "
-          f"({df.loc[target, 'signal_date']}) — actual return {actual_return:+.2f}%")
+    print(f"\nTrade closed: {target['signal_type']} "
+          f"({target['signal_date']}) — actual return {actual_return:+.2f}%")
 
-    print_pnl_summary(df)
+    print_pnl_summary(client)
 
 
 if __name__ == "__main__":
