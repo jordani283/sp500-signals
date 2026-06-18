@@ -86,3 +86,21 @@ Usage:
   unchanged from the CSV version aside from the Supabase confirmation lines.
 - `python trade_update.py` — lists PENDING trades, records your entry/exit
   prices, marks the trade CLOSED, and prints a running P&L vs the backtested EV.
+
+## Live dashboard (Streamlit)
+
+`dashboard.py` is a Streamlit app that reads the Supabase tables and shows
+today's status, signal history, the trade log, a P&L summary (when there are
+closed trades) and a static backtest reference. Data is cached with a 5-minute
+TTL so it refreshes automatically.
+
+Run locally:
+
+```bash
+.venv/bin/streamlit run dashboard.py
+```
+
+It uses the same `supabase_client` loader for credentials (no new env vars).
+On Streamlit Community Cloud, add `SUPABASE_URL` / `SUPABASE_KEY` under the
+app's Advanced settings → Secrets (TOML); they are bridged into env vars at
+startup so the loader works unchanged.
